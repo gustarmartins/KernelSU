@@ -190,7 +190,7 @@ int ksu_handle_execveat_ksud(int *fd, struct filename **filename_ptr, struct use
         return 0;
     }
 
-    if (current->pid != 1 && is_init(get_current_cred())) {
+    if (current->pid != 1 && is_init(current_cred())) {
         if (unlikely(strcmp(filename->name, KSUD_PATH) == 0)) {
             pr_info("ksud: escape to root for init executing ksud: %d\n", current->pid);
             escape_to_root_for_init();
