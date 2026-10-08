@@ -67,6 +67,7 @@
 #include "feature/adb_root.c"
 #endif
 #include "feature/kernel_umount.c"
+#include "feature/selinux_query.c"
 #include "feature/sucompat.c"
 #include "feature/sulog.c"
 #include "runtime/ksud.c"
@@ -121,6 +122,9 @@ int __init kernelsu_init(void)
     ksu_adb_root_init();
 
     ksu_kernel_umount_init();
+#if IS_BUILTIN(CONFIG_KSU)
+    ksu_selinux_query_init();
+#endif
 
     ksu_allowlist_init();
 

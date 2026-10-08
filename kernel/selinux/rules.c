@@ -18,9 +18,24 @@ static void reset_avc_cache(void)
     selinux_status_update_policyload(0);
 #else
     struct selinux_avc *avc = selinux_state.avc;
-    avc_ss_reset(avc, 0);
-    selnl_notify_policyload(0);
-    selinux_status_update_policyload(&selinux_state, 0);
+    u32 seqno = 0;
+
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 10, 0)
+    unsigned long flags;
+
+    /*
+     * Legacy policydb updates happen in place. Advance the security
+     * server's generation before flushing the AVC so decisions computed
+     * before this update cannot be inserted into the cache afterwards.
+     * Publish that same generation to every policy-load observer.
+     */
+    write_lock_irqsave(&selinux_state.ss->policy_rwlock, flags);
+    seqno = ++selinux_state.ss->latest_granting;
+    write_unlock_irqrestore(&selinux_state.ss->policy_rwlock, flags);
+#endif
+    avc_ss_reset(avc, seqno);
+    selnl_notify_policyload(seqno);
+    selinux_status_update_policyload(&selinux_state, seqno);
 #endif
     selinux_xfrm_notify_policyload();
 }
@@ -735,12 +750,11 @@ do_stop_machine:
     ret = stop_machine(handle_sepolicy_fn, (void *)&ctx, NULL);
 
 out_done:
-    if (ret)
-        goto out_free;
-
+    /* A malformed tail can fail after earlier in-place commands succeeded. */
     smp_mb();
     reset_avc_cache();
-    ret = success_cmd_count;
+    if (!ret)
+        ret = success_cmd_count;
 
 out_free:
     kvfree(payload);

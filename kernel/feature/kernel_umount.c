@@ -1,4 +1,10 @@
 static bool ksu_kernel_umount_enabled = true;
+static bool ksu_webview_zygote_umount_enabled;
+
+bool ksu_is_webview_zygote_umount_enabled(void)
+{
+    return READ_ONCE(ksu_webview_zygote_umount_enabled);
+}
 
 static int kernel_umount_feature_get(u64 *value)
 {
@@ -20,6 +26,56 @@ static const struct ksu_feature_handler kernel_umount_handler = {
     .get_handler = kernel_umount_feature_get,
     .set_handler = kernel_umount_feature_set,
 };
+
+static int webview_zygote_umount_feature_get(u64 *value)
+{
+    *value = ksu_is_webview_zygote_umount_enabled() ? 1 : 0;
+    return 0;
+}
+
+static int webview_zygote_umount_feature_set(u64 value)
+{
+    WRITE_ONCE(ksu_webview_zygote_umount_enabled, value != 0);
+    pr_info("webview_zygote_umount: set to %d\n", value != 0);
+    return 0;
+}
+
+static const struct ksu_feature_handler webview_zygote_umount_handler = {
+    .feature_id = KSU_FEATURE_WEBVIEW_ZYGOTE_UMOUNT,
+    .name = "webview_zygote_umount",
+    .get_handler = webview_zygote_umount_feature_get,
+    .set_handler = webview_zygote_umount_feature_set,
+};
+
+/* Android must have unshared the child before we touch its mounts. */
+static bool webview_has_private_mount_ns(void)
+{
+    struct task_struct *parent, *init;
+    bool private = false;
+
+    if (!current->nsproxy)
+        return false;
+
+    rcu_read_lock();
+    parent = rcu_dereference(current->real_parent);
+    task_lock(parent);
+    if (parent->nsproxy)
+        private = current->nsproxy->mnt_ns != parent->nsproxy->mnt_ns;
+    task_unlock(parent);
+
+    /* PID 1 may have unshared from swapper's initial namespace. */
+    init = pid_task(find_pid_ns(1, &init_pid_ns), PIDTYPE_PID);
+    if (!init) {
+        private = false;
+    } else {
+        task_lock(init);
+        if (!init->nsproxy || current->nsproxy->mnt_ns == init->nsproxy->mnt_ns)
+            private = false;
+        task_unlock(init);
+    }
+    rcu_read_unlock();
+    return private;
+}
 
 extern int path_umount(struct path *path, int flags);
 
@@ -59,7 +115,12 @@ int ksu_handle_umount(uid_t old_uid, uid_t new_uid)
         return 0;
     }
 
-    if (!ksu_kernel_umount_enabled) {
+    /* WebView is a separate owner: Zygisk may own normal app unmounting. */
+    if (new_uid == WEBVIEW_ZYGOTE_UID) {
+        if (!ksu_is_webview_zygote_umount_enabled() || old_uid != 0 ||
+            !webview_has_private_mount_ns())
+            return 0;
+    } else if (!READ_ONCE(ksu_kernel_umount_enabled)) {
         return 0;
     }
 
@@ -71,10 +132,10 @@ int ksu_handle_umount(uid_t old_uid, uid_t new_uid)
     // 1. Normal app: zygote -> appuid
     // 2. Isolated process forked from zygote: zygote -> isolated_process
     // 3. App zygote forked from zygote: zygote -> appuid
-    // 4. Webview zygote forked from zygote: zygote -> WEBVIEW_ZYGOTE_UID (no need to handle, app cannot run custom code)
+    // 4. Webview zygote: separately controlled, private child namespace only
     // 5. Isolated process forked from app zygote: appuid -> isolated_process (already handled by 3)
-    // 6. Isolated process forked from webview zygote (no need to handle, app cannot run custom code)
-    if (!is_appuid(new_uid) && !is_isolated_process(new_uid)) {
+    // 6. Webview renderer: inherits the sanitized namespace from case 4
+    if (!is_appuid(new_uid) && new_uid != WEBVIEW_ZYGOTE_UID && !is_isolated_process(new_uid)) {
         return 0;
     }
 
@@ -114,9 +175,13 @@ void __init ksu_kernel_umount_init(void)
     if (ksu_register_feature_handler(&kernel_umount_handler)) {
         pr_err("Failed to register kernel_umount feature handler\n");
     }
+    if (ksu_register_feature_handler(&webview_zygote_umount_handler)) {
+        pr_err("Failed to register webview_zygote_umount feature handler\n");
+    }
 }
 
 void __exit ksu_kernel_umount_exit(void)
 {
+    ksu_unregister_feature_handler(KSU_FEATURE_WEBVIEW_ZYGOTE_UMOUNT);
     ksu_unregister_feature_handler(KSU_FEATURE_KERNEL_UMOUNT);
 }
